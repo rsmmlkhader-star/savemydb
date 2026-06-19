@@ -1,6 +1,8 @@
 from flask import Flask, jsonify, request
 from flask_cors import CORS
-import os, uuid, logging
+from flask_jwt_extended import JWTManager, create_access_token, jwt_required, get_jwt_identity
+import os, uuid, json, bcrypt, logging
+from datetime import timedelta
 from dotenv import load_dotenv
 load_dotenv()
 
@@ -10,8 +12,27 @@ logger = logging.getLogger(__name__)
 app = Flask(__name__)
 CORS(app)
 
+app.config["JWT_SECRET_KEY"] = os.getenv("JWT_SECRET", "savemydb-secret-2026")
+app.config["JWT_ACCESS_TOKEN_EXPIRES"] = timedelta(hours=24)
+jwt = JWTManager(app)
+
 _connections = {}
 _sheets_creds = os.getenv("GOOGLE_CREDENTIALS_PATH", "credentials/service_account.json")
+USERS_FILE = "users.json"
+
+# ── User helpers ──────────────────────────────
+
+def load_users():
+    if not os.path.exists(USERS_FILE):
+        return {}
+    with open(USERS_FILE) as f:
+        return json.load(f)
+
+def save_users(users):
+    with open(USERS_FILE, "w") as f:
+        json.dump(users, f, indent=2)
+
+# ── Response helpers ──────────────────────────
 
 def _ok(data=None, message="OK", status=200):
     return jsonify({"status": "ok", "message": message, "data": data}), status
@@ -19,9 +40,50 @@ def _ok(data=None, message="OK", status=200):
 def _err(message, status=400):
     return jsonify({"status": "error", "message": message}), status
 
+# ── Health ────────────────────────────────────
+
 @app.get("/api/health")
 def health():
     return _ok({"version": "1.0.0", "service": "SaveMyDB"})
+
+# ── Auth ──────────────────────────────────────
+
+@app.post("/api/auth/register")
+def register():
+    body = request.get_json()
+    username = body.get("username", "").strip()
+    password = body.get("password", "").strip()
+    email    = body.get("email", "").strip()
+
+    if not username or not password:
+        return _err("Username and password are required.")
+
+    users = load_users()
+    if username in users:
+        return _err("Username already exists.")
+
+    hashed = bcrypt.hashpw(password.encode(), bcrypt.gensalt()).decode()
+    users[username] = {"password": hashed, "email": email}
+    save_users(users)
+    return _ok(message="Account created successfully!", status=201)
+
+@app.post("/api/auth/login")
+def login():
+    body = request.get_json()
+    username = body.get("username", "")
+    password = body.get("password", "")
+
+    users = load_users()
+    if username not in users:
+        return _err("Invalid username or password.", 401)
+
+    if not bcrypt.checkpw(password.encode(), users[username]["password"].encode()):
+        return _err("Invalid username or password.", 401)
+
+    token = create_access_token(identity=username)
+    return _ok({"token": token, "username": username}, "Login successful.")
+
+# ── Connections ───────────────────────────────
 
 @app.post("/api/connections")
 def create_connection():
@@ -70,6 +132,8 @@ def get_schema(conn_id, table):
     c.disconnect()
     return _ok({"schema": schema, "primary_keys": pks})
 
+# ── Sync ──────────────────────────────────────
+
 def _build_engine(body):
     conn_id = body.get("connection_id")
     meta = _connections.get(conn_id)
@@ -99,7 +163,7 @@ def sync_export():
         engine = _build_engine(body)
         rows = engine.export_to_sheet(body.get("where_clause", ""))
         engine.db.disconnect()
-        return _ok({"rows_exported": rows, "spreadsheet_id": body["spreadsheet_id"]}, f"Exported {rows} rows.")
+        return _ok({"rows_exported": rows}, f"Exported {rows} rows.")
     except Exception as exc:
         return _err(f"Export failed: {exc}", 500)
 
@@ -110,7 +174,9 @@ def sync_import():
         engine = _build_engine(body)
         stats = engine.sync_to_db()
         engine.db.disconnect()
-        return _ok({"inserts": stats.inserts, "updates": stats.updates, "deletes": stats.deletes, "skipped": stats.skipped}, f"Sync complete. {stats.total_changes} change(s) applied.")
+        return _ok({"inserts": stats.inserts, "updates": stats.updates,
+                    "deletes": stats.deletes, "skipped": stats.skipped},
+                   f"Sync complete. {stats.total_changes} change(s) applied.")
     except Exception as exc:
         return _err(f"Sync failed: {exc}", 500)
 
@@ -122,9 +188,13 @@ def sync_full():
         rows = engine.export_to_sheet()
         stats = engine.sync_to_db()
         engine.db.disconnect()
-        return _ok({"rows_exported": rows, "inserts": stats.inserts, "updates": stats.updates, "deletes": stats.deletes}, "Full sync complete.")
+        return _ok({"rows_exported": rows, "inserts": stats.inserts,
+                    "updates": stats.updates, "deletes": stats.deletes},
+                   "Full sync complete.")
     except Exception as exc:
         return _err(f"Full sync failed: {exc}", 500)
+
+# ── Audit ─────────────────────────────────────
 
 @app.get("/api/audit/<conn_id>/<table>")
 def get_audit(conn_id, table):
@@ -134,11 +204,11 @@ def get_audit(conn_id, table):
     from savemydb.audit import AuditLogger
     c = get_connector(meta["db_type"], meta["config"])
     c.connect()
-    history = AuditLogger(c).get_history(table, request.args.get("row_id"), int(request.args.get("limit", 100)))
+    history = AuditLogger(c).get_history(
+        table, request.args.get("row_id"),
+        int(request.args.get("limit", 100)))
     c.disconnect()
     return _ok(history)
 
-if __name__ == "__main__":
-    port = int(os.getenv("PORT", 5000))
-    logger.info("SaveMyDB API starting on port %d", port)
-    app.run(host="0.0.0.0", port=port, debug=True)
+# ── Entry point ───────────────────────────────
+
