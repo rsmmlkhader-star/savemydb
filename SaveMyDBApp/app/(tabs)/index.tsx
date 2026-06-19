@@ -2,7 +2,7 @@ import { useState, useEffect } from 'react';
 import { ScrollView, StyleSheet, Text, TouchableOpacity, View, TextInput, ActivityIndicator } from 'react-native';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 
-const API = 'https://savemydb-production.up.railway.app';
+const API = 'https://savemydb-w5gi.onrender.com';
 
 export default function HomeScreen() {
   const [screen, setScreen] = useState<'login' | 'home'>('login');

@@ -2,6 +2,8 @@ from flask import Flask, jsonify, request
 from flask_cors import CORS
 from flask_jwt_extended import JWTManager, create_access_token, jwt_required, get_jwt_identity
 import os, uuid, json, bcrypt, logging
+from apscheduler.schedulers.background import BackgroundScheduler
+import atexit
 from datetime import timedelta
 from dotenv import load_dotenv
 load_dotenv()
@@ -209,6 +211,27 @@ def get_audit(conn_id, table):
         int(request.args.get("limit", 100)))
     c.disconnect()
     return _ok(history)
-
 # ── Entry point ───────────────────────────────
+# ── Auto Sync ─────────────────────────────────────────────────────
 
+def auto_sync_job():
+    logger.info("⏰ Auto sync triggered...")
+    for conn_id, meta in _connections.items():
+        try:
+            from savemydb.db_connector import get_connector
+            c = get_connector(meta["db_type"], meta["config"])
+            c.connect()
+            c.disconnect()
+            logger.info(f"✅ Auto sync OK for connection {conn_id}")
+        except Exception as e:
+            logger.error(f"❌ Auto sync failed for {conn_id}: {e}")
+
+scheduler = BackgroundScheduler()
+scheduler.add_job(func=auto_sync_job, trigger="interval", minutes=30)
+scheduler.start()
+atexit.register(lambda: scheduler.shutdown())
+
+if __name__ == "__main__":
+    port = int(os.getenv("PORT", 5000))
+    logger.info("SaveMyDB API starting on port %d", port)
+    app.run(host="0.0.0.0", port=port, debug=True)
